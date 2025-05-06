@@ -3,3 +3,4 @@ openai
 requests
 feedparser
 plotly
+bs4
