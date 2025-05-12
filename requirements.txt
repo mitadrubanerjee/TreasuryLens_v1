@@ -4,3 +4,4 @@ requests
 feedparser
 plotly
 bs4
+re
