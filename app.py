@@ -159,29 +159,99 @@ def fetch_currency_headlines(pair: str) -> List[str]:
         st.error(f"Error fetching headlines for {pair}: {e}")
         return []
 
+# ── Text Cleaner───────────────────────────────────────────
+
+def clean_text(text: str) -> str:
+    # 1. Fix glued number + billion/million
+    text = re.sub(r'(?<=\d)(?=(billion|million|trillion))', r' ', text, flags=re.IGNORECASE)
+
+    # 2. Fix glued lowercase-uppercase transitions (e.g., "signalsrobust" -> "signals robust")
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', r' ', text)
+
+    # 3. Normalize broken bold markers
+    text = re.sub(r'\*{2,}', '**', text)
+
+    return text.strip()
+
+
 # ── GPT Analysis ───────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def analyze_with_gpt(snippets: List[str]) -> Tuple[List[str], str, Dict[str,int]]:
+@st.cache_data(ttl=3600, show_spinner=False) 
+def analyze_with_gpt(snippets: List[str]) -> Tuple[List[str], str, Dict[str, int], str]:
     if not snippets:
-        return [], "neutral", {"positive":0, "neutral":0, "negative":0}
+        return [], "neutral", {"positive": 0, "neutral": 0, "negative": 0}, "No explanation available due to missing data."
+
     joined = "\n".join(f"- {s}" for s in snippets)
+
     prompt = f"""
-You are an FX market analyst. Here are the latest news items:
-{joined}
+You are a highly experienced Forex trader with over 10 years of expertise in analyzing global currency markets. You’ve traded through rate hike cycles, QE tapers, geopolitical crises, and central bank pivots. Based on the input text (a set of recent news headlines and summaries), your job is to extract exactly FIVE high-impact market insights that are:
 
-1) In 10 sentences, summarize the key themes and market drivers. Max 30 words per sentence.
-2) State the overall tone from [positive, neutral, negative].
-3) Provide sentiment counts.
-4) Mention main themes.
+1. Highly relevant to currency traders and institutional investors.
+2. Focused on macroeconomic developments, central bank signals, inflation trends, geopolitical risk, or surprise data points that could move FX markets.
+3. Written in a consistent, narrative progression — from macro themes to specific trade implications.
+4. Deeply analytical — avoid vague takeaways like “Fed to pause hikes” or “Euro may rise.” Each insight must include the **cause**, **effect**, and **market implication**.
 
-Respond only in this exact JSON format:
+Use a professional, precise, and insight-rich tone. Your goal is to provide **immediate trading value**.
+
+Each takeaway should follow this structure:
+- **Headline-style summary** (bold)
+- 1-2 sentences of detailed analysis (include *why it matters*, *how it affects specific currencies*, and *what traders should watch next*)
+
+---
+
+**EXAMPLE OUTPUT:**
+
+1. **Dollar faces fresh headwinds as Fed minutes signal a dovish pivot**  
+   The FOMC minutes reveal growing consensus to hold off on further hikes amid cooling labor market data. This could suppress USD demand short-term, especially against yield-seeking pairs like AUD and NZD.
+
+2. **Euro resilience supported by hawkish ECB tones despite growth concerns**  
+   ECB board members maintain a data-dependent but hawkish stance, citing sticky core inflation. EUR/USD may find support unless upcoming PMI data disappoints significantly.
+
+3. **JPY strengthens on safe haven flows amid Middle East tensions**  
+   Renewed geopolitical risk is prompting risk-off sentiment globally, benefitting JPY and CHF. Traders should monitor oil price spikes and U.S. defense positioning for directional cues.
+
+4. **Sterling under pressure as UK wage growth cools sharply**  
+   Slower-than-expected wage data dampens BoE’s tightening outlook. GBP/USD risks breaking below key support if CPI also moderates this week.
+
+5. **Emerging market currencies vulnerable as US 10Y yield rebounds**  
+   A sharp uptick in U.S. long-end yields is reversing recent capital flows to EMs. Currencies like INR, BRL, and ZAR could see renewed selling pressure, especially if U.S. retail sales surprise on the upside.
+
+---
+
+Now, based on the above 5 insights, do the following:
+
+6. Assign an **overall sentiment** from one of the following five options:
+   - Positive
+   - Trending Positive
+   - Neutral
+   - Trending Negative
+   - Negative
+
+7. Provide a 2-3 sentence **explanation** for this sentiment label. Make this grounded in the themes you identified. Don’t be vague — clearly connect it to central bank tone, risk sentiment, data, or market reactions.
+
+8. Return a count of sentiment-bearing headlines, like:
+   {{ "positive": X, "neutral": Y, "negative": Z }}
+
+---
+
+Respond only with a valid Python dictionary in this format:
 
 {{
-  "summary_points": ["...", "...", "..."],
-  "overall_sentiment": "positive|neutral|negative",
-  "counts": {{"positive": X, "neutral": Y, "negative": Z}}
+  "summary_points": [
+    "Insight 1 (headline + explanation)",
+    "Insight 2 (headline + explanation)",
+    "Insight 3 (headline + explanation)",
+    "Insight 4 (headline + explanation)",
+    "Insight 5 (headline + explanation)"
+  ],
+  "overall_sentiment": "Positive | Trending Positive | Neutral | Trending Negative | Negative",
+  "sentiment_explainer": "This week’s sentiment is [label] because ...",
+  "counts": {{ "positive": X, "neutral": Y, "negative": Z }}
 }}
+
+Here are the latest forex headlines:
+{joined}
 """
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -193,18 +263,24 @@ Respond only in this exact JSON format:
         )
         text = resp.choices[0].message.content
         result = json.loads(text)
+
         bullets = result.get("summary_points", [])
         tone = result.get("overall_sentiment", "neutral")
+        explanation = result.get("sentiment_explainer", "No explanation provided.")
         counts = result.get("counts", {})
         for k in ("positive", "neutral", "negative"):
             counts.setdefault(k, 0)
-        return bullets, tone, counts
+
+        return bullets, tone, counts, explanation
+
     except json.JSONDecodeError:
         st.error("Could not parse GPT output.")
-        return [], "neutral", {"positive":0, "neutral":0, "negative":0}
+        return [], "neutral", {"positive": 0, "neutral": 0, "negative": 0}, "No explanation (JSON error)."
+
     except Exception as e:
         st.error(f"GPT analysis failed: {e}")
-        return [], "neutral", {"positive":0, "neutral":0, "negative":0}
+        return [], "neutral", {"positive": 0, "neutral": 0, "negative": 0}, "No explanation (exception occurred)."
+
 
 # ── Renderer: Week Ahead Grid ─────────────────────────────
 from collections import defaultdict
@@ -242,27 +318,71 @@ def render_week_ahead_horizontal(events: List[Dict]):
 
 
 # ── Renderer: Sentiment Panels ───────────────────────────
-def render_global_panel(bullets: List[str], overall: str, breakdown: Dict[str,int]):
-    st.markdown("### Global FX Sentiment")
-    cls = f"metric-{overall.lower()}"
-    st.markdown(f"""<div class="{cls}"><strong>Overall Sentiment:</strong> {overall.title()}</div>""", unsafe_allow_html=True)
-    bullet_html = "\n".join(f"<li>{b}</li>" for b in bullets)
-    st.markdown(f"""<div class="card"><h3>Key Takeaways</h3><ul>{bullet_html}</ul></div>""", unsafe_allow_html=True)
+# ── Helper: Assign color class to sentiment ──
+def get_sentiment_class(sentiment: str) -> str:
+    s = sentiment.lower().strip()
+    if "negative" in s:
+        return "background-color: #ff4d4d; color: white; padding: 6px 12px; border-radius: 6px; display: inline-block;"
+    elif "positive" in s:
+        return "background-color: #4CAF50; color: white; padding: 6px 12px; border-radius: 6px; display: inline-block;"
+    else:
+        return "background-color: #ffcc00; color: black; padding: 6px 12px; border-radius: 6px; display: inline-block;"
+
+
+# ── Renderer: Global Panel ───────────────────────
+def render_global_panel(bullets: List[str], overall: str, breakdown: Dict[str,int], explanation: str):
+    st.markdown("### 🌍 Global FX Sentiment")
+
+    sentiment_style = get_sentiment_class(overall)
+    st.markdown(f"""<div style="{sentiment_style}; margin-bottom: 1rem;"><strong>Overall Sentiment:</strong> {overall}</div>""", unsafe_allow_html=True)
+
+    with st.expander("Why this sentiment?"):
+        st.markdown(clean_text(explanation))
+
+    st.markdown(f"""<div class="card"><h3>Key Takeaways</h3></div>""", unsafe_allow_html=True)
+    for i, b in enumerate(bullets, 1):
+        b = clean_text(b)
+
+        # Try to isolate **bold headline** from the rest
+        match = re.match(r"^\*\*(.+?)\*\*(.*)", b)
+        if match:
+            headline = match.group(1).strip()
+            explanation = match.group(2).strip()
+            st.markdown(f"- **{headline}**  \n  {explanation}")
+        else:
+            # fallback in case there's no proper **headline**
+            st.markdown(f"- {b}")
+
+
     fig = px.pie(names=list(breakdown.keys()), values=list(breakdown.values()), hole=0.4)
     fig.update_traces(textinfo="percent+label", marker=dict(line=dict(color="white", width=2)))
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
 
-def render_currency_panel(bullets: List[str], overall: str, breakdown: Dict[str,int]):
-    st.markdown("### Currency-Pair Deep Dive")
-    cls = f"metric-{overall.lower()}"
-    st.markdown(f"""<div class="{cls}"><strong>Overall Sentiment:</strong> {overall.title()}</div>""", unsafe_allow_html=True)
-    bullet_html = "\n".join(f"<li>{b}</li>" for b in bullets)
-    st.markdown(f"""<div class="card"><h3>Highlights</h3><ul>{bullet_html}</ul></div>""", unsafe_allow_html=True)
+
+# ── Renderer: Currency Panel ─────────────────────
+def render_currency_panel(bullets: List[str], overall: str, breakdown: Dict[str,int], explanation: str):
+    st.markdown("### 💱 Currency-Pair Deep Dive")
+
+    sentiment_style = get_sentiment_class(overall)
+    st.markdown(f"""<div style="{sentiment_style}; margin-bottom: 1rem;"><strong>Overall Sentiment:</strong> {overall}</div>""", unsafe_allow_html=True)
+
+    with st.expander("Why this sentiment?"):
+        st.markdown(explanation)
+
+    st.markdown(f"""<div class="card"><h3>Highlights</h3></div>""", unsafe_allow_html=True)
+    for i, b in enumerate(bullets, 1):
+        if "**" in b:
+            headline, rest = b.split("**", 2)[1], b.split("**", 2)[2].strip()
+            st.markdown(f"- **{headline}**  \n  {rest}")
+        else:
+            st.markdown(f"- {b}")
+
     fig = px.pie(names=list(breakdown.keys()), values=list(breakdown.values()), hole=0.4)
     fig.update_traces(textinfo="percent+label", marker=dict(line=dict(color="white", width=2)))
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
+
 
 # ── Main App ──────────────────────────────────────────────
 def main():
@@ -278,12 +398,13 @@ def main():
         with st.spinner("Fetching and analyzing global news..."):
             try:
                 snippets = fetch_global_headlines()
-                bullets, overall, counts = analyze_with_gpt(snippets)
+                bullets, overall, counts, explanation = analyze_with_gpt(snippets)
                 st.session_state["summary_data"] = {
                     "snippets": snippets,
                     "bullets": bullets,
                     "overall": overall,
                     "counts": counts,
+                    "explanation": explanation,
                 }
                 st.session_state.summary_ready = True
                 st.session_state.chat_history = []
@@ -295,8 +416,9 @@ def main():
         bullets = st.session_state["summary_data"]["bullets"]
         overall = st.session_state["summary_data"]["overall"]
         counts = st.session_state["summary_data"]["counts"]
+        explanation = st.session_state["summary_data"]["explanation"]
 
-        render_global_panel(bullets, overall, counts)
+        render_global_panel(bullets, overall, counts, explanation)
 
         st.markdown("#### Ask a follow-up question")
         user_followup = st.text_input("Your question:", key="followup_input")
@@ -349,16 +471,16 @@ def main():
 
     st.markdown("---")
 
-    pair = st.selectbox("Select Currency Pair to Analyze:", ["EUR/USD", "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/INR", "USD/CNH", "EUR/CHF", "EUR/NOK", "USD/BRL", "USD/ZAR", "USD/MXN","USD/IDR"])
+    pair = st.selectbox("Select Currency Pair to Analyze:", ["EUR/USD", "EUR/GBP", "USD/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/INR", "USD/CNH", "EUR/CHF", "EUR/NOK", "USD/BRL", "USD/ZAR", "USD/MXN", "USD/IDR"])
     if st.button("Analyze This Pair"):
         with st.spinner(f"Analyzing sentiment for {pair}..."):
             try:
                 snippets = fetch_currency_headlines(pair)
-                bullets, overall, counts = analyze_with_gpt(snippets)
-                render_currency_panel(bullets, overall, counts)
+                bullets, overall, counts, explanation = analyze_with_gpt(snippets)
+                render_currency_panel(bullets, overall, counts, explanation)
             except Exception as e:
                 st.error(f"Could not fetch or analyze {pair}: {e}")
-    
+
     events = scrape_calendar()
     render_week_ahead_horizontal(events)
 
